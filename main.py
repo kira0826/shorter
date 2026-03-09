@@ -1,33 +1,98 @@
 """
-pdf_splitter.py — Extrae y consolida páginas de todos los PDFs de una carpeta.
+main.py — Consolida N carpetas de PDFs en un único PDF final con cortes por rango.
 
-Los rangos/páginas indicados se extraen de cada PDF y se unen en UN SOLO PDF
-de salida por archivo. El orden de las páginas en el output respeta el orden
-en que se pasan los rangos.
+Antes de los PDFs de cada carpeta inserta una página de portada con el nombre
+de la carpeta. De cada PDF solo se extraen las páginas indicadas por los rangos,
+consolidadas en orden en el PDF final.
+
+Si NO se pasan rangos, se incluyen TODAS las páginas de cada PDF.
 
 Uso:
-    python pdf_splitter.py <carpeta_entrada> <carpeta_salida> <rango1> [rango2] ...
+    python main.py <carpeta_raiz> <archivo_salida.pdf> [rango1] [rango2] ...
 
 Argumentos:
-    carpeta_entrada   Carpeta con los archivos .pdf a procesar.
-    carpeta_salida    Carpeta donde se guardarán los PDFs resultantes.
-    rangos            Páginas o rangos a incluir. Formato:  N  o  N-M
+    carpeta_raiz        Carpeta que contiene las subcarpetas con PDFs.
+    archivo_salida.pdf  Ruta del PDF final consolidado.
+    rangos              (Opcional) Páginas o rangos a extraer. Formato: N o N-M
 
 Ejemplos:
-    # Extrae páginas 1-5 y 11-20 de cada PDF (un solo PDF de salida por archivo)
-    python pdf_splitter.py ./documentos ./output 1-5 11-20
+    # Sin rangos: incluye todas las páginas
+    python main.py ./data/zona01 ./salida.pdf
 
-    # Páginas sueltas
-    python pdf_splitter.py ./documentos ./output 1 3 5 7
-
-    # Mezcla libre
-    python pdf_splitter.py ./documentos ./output 1-3 7 10-12
+    # Con rangos: solo extrae esas páginas de cada PDF
+    python main.py ./data/zona01 ./salida.pdf 1-5 6-10
+    python main.py ./data/zona01 ./salida.pdf 1 3 5
+    python main.py ./data/zona01 ./salida.pdf 1-3 7 10-12
 """
 
 import sys
 import os
+import io
 import glob
 from pypdf import PdfReader, PdfWriter
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+
+
+def make_cover_page(folder_name: str) -> PdfReader:
+    buffer = io.BytesIO()
+    width, height = letter
+
+    c = canvas.Canvas(buffer, pagesize=letter)
+
+    # Fondo oscuro
+    c.setFillColor(colors.HexColor("#1a1a2e"))
+    c.rect(0, 0, width, height, fill=True, stroke=False)
+
+    # Franja lateral izquierda
+    c.setFillColor(colors.HexColor("#e94560"))
+    c.rect(0, 0, 12, height, fill=True, stroke=False)
+
+    # Líneas decorativas
+    c.setFillColor(colors.HexColor("#e94560"))
+    c.rect(40, height - 80, width - 80, 3, fill=True, stroke=False)
+    c.rect(40, 80, width - 80, 3, fill=True, stroke=False)
+
+    # Etiqueta
+    c.setFillColor(colors.HexColor("#e94560"))
+    c.setFont("Helvetica", 11)
+    c.drawString(40, height - 110, "SECCIÓN")
+
+    # Nombre de carpeta (título)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 36)
+
+    max_width = width - 80
+    words = folder_name.split()
+    lines = []
+    current = ""
+    for word in words:
+        test = f"{current} {word}".strip()
+        if c.stringWidth(test, "Helvetica-Bold", 36) <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+
+    line_height = 44
+    total_text_height = len(lines) * line_height
+    y_start = (height / 2) + (total_text_height / 2)
+
+    for i, line in enumerate(lines):
+        c.drawString(40, y_start - i * line_height, line)
+
+    # Pie
+    c.setFillColor(colors.HexColor("#aaaaaa"))
+    c.setFont("Helvetica", 9)
+    c.drawString(40, 55, folder_name)
+
+    c.save()
+    buffer.seek(0)
+    return PdfReader(buffer)
 
 
 def parse_range(range_str: str, total_pages: int) -> list[int] | None:
@@ -45,90 +110,102 @@ def parse_range(range_str: str, total_pages: int) -> list[int] | None:
         raise ValueError(f"Rango inválido: '{range_str}'.")
 
     if end > total_pages:
-        print(f"    ⚠️  Rango '{range_str}' excede las {total_pages} páginas — omitido.")
+        print(f"       ⚠️  Rango '{range_str}' excede las {total_pages} páginas — omitido.")
         return None
 
-    return list(range(start - 1, end))  # 0-based
+    return list(range(start - 1, end))
 
 
-def extract_pages(input_path: str, output_dir: str, ranges: list[str]) -> bool:
+def get_page_indices(reader: PdfReader, ranges: list[str]) -> list[int]:
     """
-    Extrae las páginas indicadas por los rangos y las consolida en UN solo PDF.
-    Retorna True si se generó el archivo, False si no hubo páginas válidas.
+    Retorna los índices 0-based de las páginas a incluir.
+    Si no hay rangos, retorna todas las páginas.
     """
-    reader = PdfReader(input_path)
-    total_pages = len(reader.pages)
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    total = len(reader.pages)
+    if not ranges:
+        return list(range(total))
 
-    print(f"\n  📄 {os.path.basename(input_path)}  ({total_pages} pág.)")
-
-    writer = PdfWriter()
-    included = []
-
-    for range_str in ranges:
-        try:
-            page_indices = parse_range(range_str, total_pages)
-        except ValueError as e:
-            print(f"    ❌ {e}")
-            continue
-
-        if page_indices is None:
-            continue
-
-        for idx in page_indices:
-            writer.add_page(reader.pages[idx])
-            included.append(idx + 1)  # 1-based para el log
-
-    if not included:
-        print(f"    ⚠️  Ninguna página válida — archivo omitido.")
-        return False
-
-    out_path = os.path.join(output_dir, f"{base_name}_recortado.pdf")
-    with open(out_path, "wb") as f:
-        writer.write(f)
-
-    pages_summary = ", ".join(str(p) for p in included)
-    print(f"    ✅ {len(included)} página(s) incluida(s): [{pages_summary}]")
-    print(f"       → {os.path.basename(out_path)}")
-    return True
+    indices = []
+    for r in ranges:
+        result = parse_range(r, total)
+        if result:
+            indices.extend(result)
+    return indices
 
 
-def process_folder(input_folder: str, output_folder: str, ranges: list[str]) -> None:
-    if not os.path.isdir(input_folder):
-        raise NotADirectoryError(f"La carpeta de entrada no existe: {input_folder}")
+def consolidate(root_folder: str, output_path: str, ranges: list[str]) -> None:
+    if not os.path.isdir(root_folder):
+        raise NotADirectoryError(f"La carpeta raíz no existe: {root_folder}")
 
-    pdf_files = sorted(glob.glob(os.path.join(input_folder, "*.pdf")))
+    subfolders = sorted([
+        f for f in os.scandir(root_folder) if f.is_dir()
+    ], key=lambda f: f.name.lower())
 
-    if not pdf_files:
-        print(f"⚠️  No se encontraron archivos .pdf en: {input_folder}")
+    if not subfolders:
+        print(f"⚠️  No se encontraron subcarpetas en: {root_folder}")
         return
 
-    os.makedirs(output_folder, exist_ok=True)
+    writer = PdfWriter()
+    total_pdfs = 0
+    total_pages = 0
 
-    print(f"📂 Entrada  : {os.path.abspath(input_folder)}")
-    print(f"📂 Salida   : {os.path.abspath(output_folder)}")
-    print(f"📋 Selección: {' | '.join(ranges)}")
-    print(f"🗂️  PDFs     : {len(pdf_files)}")
+    range_label = " | ".join(ranges) if ranges else "todas las páginas"
+    print(f"📂 Carpeta raíz : {os.path.abspath(root_folder)}")
+    print(f"📄 Salida       : {os.path.abspath(output_path)}")
+    print(f"📋 Cortes       : {range_label}")
+    print(f"🗂️  Subcarpetas  : {len(subfolders)}\n")
 
-    generated = sum(
-        extract_pages(pdf_path, output_folder, ranges)
-        for pdf_path in pdf_files
-    )
+    for folder in subfolders:
+        pdf_files = sorted(glob.glob(os.path.join(folder.path, "*.pdf")))
+        print(f"  📁 {folder.name}  ({len(pdf_files)} PDF(s))")
 
-    print(f"\n🎉 {generated}/{len(pdf_files)} PDF(s) generado(s) en: {os.path.abspath(output_folder)}")
+        # Portada de sección
+        cover = make_cover_page(folder.name)
+        writer.add_page(cover.pages[0])
+        total_pages += 1
+
+        for pdf_path in pdf_files:
+            try:
+                reader = PdfReader(pdf_path)
+                indices = get_page_indices(reader, ranges)
+
+                if not indices:
+                    print(f"     ⚠️  {os.path.basename(pdf_path)} — ninguna página válida, omitido.")
+                    continue
+
+                for idx in indices:
+                    writer.add_page(reader.pages[idx])
+
+                total_pdfs += 1
+                total_pages += len(indices)
+                pages_info = f"{len(indices)} pág." if ranges else f"{len(reader.pages)} pág."
+                print(f"     ✅ {os.path.basename(pdf_path)}  ({pages_info})")
+
+            except Exception as e:
+                print(f"     ❌ {os.path.basename(pdf_path)} — {e}")
+
+        print()
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    print(f"🎉 Consolidado listo.")
+    print(f"   {len(subfolders)} sección(es)  |  {total_pdfs} PDF(s)  |  {total_pages} página(s) en total")
+    print(f"   → {os.path.abspath(output_path)}")
 
 
 def main():
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(__doc__)
         sys.exit(1)
 
-    input_folder  = sys.argv[1]
-    output_folder = sys.argv[2]
-    ranges        = sys.argv[3:]
+    root_folder = sys.argv[1]
+    output_path = sys.argv[2]
+    ranges      = sys.argv[3:]  # opcional
 
     try:
-        process_folder(input_folder, output_folder, ranges)
+        consolidate(root_folder, output_path, ranges)
     except (NotADirectoryError, ValueError) as e:
         print(f"\n❌ Error: {e}")
         sys.exit(1)
